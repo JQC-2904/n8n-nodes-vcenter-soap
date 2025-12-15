@@ -36,6 +36,13 @@ export class VCenterSoapApi implements ICredentialType {
       description: 'Whether to skip TLS certificate verification for lab environments',
     },
     {
+      displayName: 'Custom CA Certificate',
+      name: 'caCertificate',
+      type: 'string',
+      default: '',
+      description: 'PEM-encoded certificate for private or self-signed authorities',
+    },
+    {
       displayName: 'Request Timeout (ms)',
       name: 'timeout',
       type: 'number',

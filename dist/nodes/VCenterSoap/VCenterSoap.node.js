@@ -154,6 +154,7 @@ class VCenterSoap {
             username: credentials.username,
             password: credentials.password,
             allowInsecure: credentials.allowInsecure,
+            caCertificate: credentials.caCertificate,
             timeout: credentials.timeout ?? 15000,
         });
         if (resource === 'connection' && operation === 'test') {

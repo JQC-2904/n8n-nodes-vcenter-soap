@@ -3,6 +3,7 @@ export interface SoapClientOptions {
     username: string;
     password: string;
     allowInsecure?: boolean;
+    caCertificate?: string;
     timeout?: number;
     soapVersion?: string;
 }
@@ -33,6 +34,7 @@ export declare class VCenterSoapClient {
     private readonly parser;
     private readonly builder;
     constructor(options: SoapClientOptions);
+    private createHttpsAgent;
     private buildEnvelope;
     private parseResponse;
     private send;

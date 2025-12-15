@@ -160,6 +160,7 @@ export class VCenterSoap implements INodeType {
       username: credentials.username as string,
       password: credentials.password as string,
       allowInsecure: credentials.allowInsecure as boolean,
+      caCertificate: credentials.caCertificate as string,
       timeout: (credentials.timeout as number) ?? 15000,
     });
 
