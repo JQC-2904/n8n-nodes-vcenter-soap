@@ -1,0 +1,45 @@
+{
+  "name": "n8n-nodes-vcenter-soap",
+  "version": "0.1.0",
+  "description": "n8n community node for VMware vCenter SOAP (connection test only)",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [
+    "n8n-community-node",
+    "vcenter",
+    "soap"
+  ],
+  "author": "",
+  "n8n": {
+    "credentials": [
+      {
+        "name": "VCenterSoapApi",
+        "source": "./dist/credentials/VCenterSoapApi.credentials.js"
+      }
+    ],
+    "nodes": [
+      {
+        "name": "VCenterSoap",
+        "source": "./dist/nodes/VCenterSoap/VCenterSoap.node.js"
+      }
+    ]
+  },
+  "dependencies": {
+    "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "@types/xml2js": "^0.4.14",
+    "n8n-core": "^1.0.0",
+    "n8n-workflow": "^1.0.0",
+    "typescript": "^5.5.0"
+  },
+  "peerDependencies": {
+    "n8n-core": "^1.0.0",
+    "n8n-workflow": "^1.0.0"
+  }
+}
