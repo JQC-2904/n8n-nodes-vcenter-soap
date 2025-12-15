@@ -58,6 +58,8 @@ class VCenterSoapClient {
             baseURL: this.endpoint,
             timeout: options.timeout ?? 15000,
             httpsAgent,
+            proxy: false,
+            maxRedirects: 0,
             validateStatus: () => true,
             responseType: 'text',
             transformResponse: [(response) => response],
@@ -65,13 +67,16 @@ class VCenterSoapClient {
     }
     normalizeEndpoint(baseUrl) {
         const trimmed = baseUrl.replace(/\/+$/, '').replace(/\/sdk\/vimService\.wsdl$/i, '/sdk');
+        if (!/^https:\/\//i.test(trimmed)) {
+            throw new Error('Only HTTPS endpoints are supported for SOAP transport.');
+        }
         if (trimmed.endsWith('/sdk'))
             return trimmed;
         return `${trimmed}/sdk`;
     }
     createHttpsAgent() {
         return new https.Agent({
-            keepAlive: true,
+            keepAlive: false,
             rejectUnauthorized: !this.options.allowInsecure,
             ca: this.options.caCertificate,
         });
@@ -84,6 +89,15 @@ class VCenterSoapClient {
                 'soapenv:Body': body,
             },
         });
+    }
+    normalizeSoapBody(body) {
+        const envelope = typeof body === 'string' ? body : this.buildEnvelope(body);
+        const soapBody = (envelope instanceof Buffer ? envelope.toString('utf8') : String(envelope)).replace(/^\uFEFF/, '');
+        const normalized = soapBody.replace(/^\s+/, '');
+        if (!normalized.startsWith('<')) {
+            throw new Error('SOAP body must start with "<" after normalization.');
+        }
+        return normalized;
     }
     parseResponse(xml) {
         try {
@@ -103,18 +117,22 @@ class VCenterSoapClient {
         const match = xml.match(/<faultstring[^>]*>([\s\S]*?)<\/faultstring>/i);
         return match?.[1]?.trim();
     }
-    async send(body, soapAction) {
-        const envelope = typeof body === 'string' ? body : this.buildEnvelope(body);
-        const soapActionHeader = soapAction ?? 'urn:vim25/7.0';
+    async send(body, _soapAction) {
+        const soapActionHeader = 'urn:vim25/7.0';
+        const soapBody = this.normalizeSoapBody(body);
         const headers = {
             'Content-Type': 'text/xml; charset=utf-8',
             Accept: 'text/xml',
             SOAPAction: soapActionHeader,
         };
+        headers['Content-Length'] = Buffer.byteLength(soapBody, 'utf8').toString();
         if (this.sessionCookie) {
             headers.Cookie = `vmware_soap_session=${this.sessionCookie}`;
         }
-        const response = await this.http.post('', envelope, { headers });
+        const response = await this.http.post('', soapBody, {
+            headers,
+            maxRedirects: 0,
+        });
         const setCookie = response.headers['set-cookie'];
         if (setCookie) {
             const session = setCookie.find((cookie) => cookie.startsWith('vmware_soap_session'));

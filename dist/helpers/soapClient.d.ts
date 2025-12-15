@@ -38,6 +38,7 @@ export declare class VCenterSoapClient {
     private normalizeEndpoint;
     private createHttpsAgent;
     private buildEnvelope;
+    private normalizeSoapBody;
     private parseResponse;
     private extractFaultString;
     private send;
