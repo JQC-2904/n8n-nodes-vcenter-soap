@@ -30,6 +30,7 @@ export declare class VCenterSoapClient {
     retrieveServiceContent(): Promise<RetrieveServiceContentResult>;
     login(sessionManager: string): Promise<void>;
     private buildEnvelope;
+    private ensureRetrievePropertiesExOptions;
     private escapeXml;
     private logDebug;
     private sendSoapRequest;
