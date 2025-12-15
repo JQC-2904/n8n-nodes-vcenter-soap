@@ -15,18 +15,34 @@ class VCenterSoapClient {
         this.parser = new fast_xml_parser_1.XMLParser({ ignoreAttributes: false, attributeNamePrefix: '', removeNSPrefix: true });
         this.builder = new fast_xml_parser_1.XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '', suppressBooleanAttributes: false });
         this.options = options;
-        const httpsAgent = new https_1.default.Agent({
-            rejectUnauthorized: !options.allowInsecure,
-        });
+        // TLS handling is explicit and scoped: use a custom https.Agent for SOAP requests only.
+        // - If allowInsecure is true, certificate verification is skipped for lab environments.
+        // - If a custom CA is provided, it is injected while keeping verification enabled.
+        // - Otherwise, Node.js default verification is used.
+        const httpsAgent = this.createHttpsAgent();
         const axiosConfig = {
             baseURL: `${options.baseUrl.replace(/\/$/, '')}/sdk`,
             timeout: options.timeout ?? 15000,
-            httpsAgent,
             headers: {
                 'Content-Type': 'text/xml; charset=utf-8',
             },
         };
+        if (httpsAgent) {
+            axiosConfig.httpsAgent = httpsAgent;
+        }
         this.http = axios_1.default.create(axiosConfig);
+    }
+    createHttpsAgent() {
+        if (this.options.allowInsecure) {
+            return new https_1.default.Agent({ rejectUnauthorized: false });
+        }
+        if (this.options.caCertificate) {
+            return new https_1.default.Agent({
+                ca: this.options.caCertificate,
+                rejectUnauthorized: true,
+            });
+        }
+        return undefined;
     }
     buildEnvelope(body) {
         return this.builder.build({
