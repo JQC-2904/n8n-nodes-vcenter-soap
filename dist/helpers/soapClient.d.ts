@@ -1,4 +1,4 @@
-import { URL } from 'url';
+import { URL } from 'node:url';
 interface VCenterSoapConfig {
     serverUrl: string;
     username: string;

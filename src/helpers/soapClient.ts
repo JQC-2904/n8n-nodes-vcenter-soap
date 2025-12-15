@@ -1,5 +1,6 @@
-import https from 'https';
-import { URL } from 'url';
+import * as https from 'node:https';
+import { IncomingMessage } from 'node:http';
+import { URL } from 'node:url';
 import { parseStringPromise, processors } from 'xml2js';
 
 interface VCenterSoapConfig {
@@ -161,7 +162,7 @@ export class VCenterSoapClient {
     };
 
     return new Promise<string>((resolve, reject) => {
-      const req = https.request(options, (res) => {
+      const req = https.request(options, (res: IncomingMessage) => {
         const chunks: Buffer[] = [];
 
         const setCookieHeader = res.headers['set-cookie'];
@@ -172,7 +173,7 @@ export class VCenterSoapClient {
           }
         }
 
-        res.on('data', (chunk) => {
+        res.on('data', (chunk: Buffer | string) => {
           chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
         });
 
@@ -188,7 +189,7 @@ export class VCenterSoapClient {
         });
       });
 
-      req.on('error', (error) => {
+      req.on('error', (error: Error) => {
         reject(error);
       });
 
