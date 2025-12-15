@@ -289,6 +289,11 @@ export class VCenterSoapClient {
     let propSetCount = 0;
 
     for (const obj of objects) {
+      const objRef = obj?.obj?._ ?? obj?.obj;
+      if (typeof objRef === 'string') {
+        moRefs.push({ moRef: objRef, type: this.normalizeMoRefType(obj?.obj?.type, objRef) });
+      }
+
       const propSets = Array.isArray(obj.propSet) ? obj.propSet : obj.propSet ? [obj.propSet] : [];
       propSetCount += propSets.length;
 
@@ -304,7 +309,15 @@ export class VCenterSoapClient {
       }
     }
 
-    if (this.config.debug) {
+    if (moRefs.length === 0) {
+      this.logDebug('RetrievePropertiesEx no results', {
+        context,
+        rawSnippet: xml.substring(0, 500),
+        valCount: rawValMoRefs.length,
+        objectCount: objects.length,
+        propSetCount,
+      });
+    } else if (this.config.debug) {
       this.logDebug('RetrievePropertiesEx response', {
         context,
         rawSnippet: xml.substring(0, 500),
@@ -567,6 +580,7 @@ export class VCenterSoapClient {
 
     const matchedVMs: string[] = [];
     const nameMatches = new Map<string, string>();
+    let totalVmNamesFetched = 0;
 
     const vmChunks = this.chunkArray(discoveredVmList, 100);
     for (const vmChunk of vmChunks) {
@@ -585,6 +599,7 @@ export class VCenterSoapClient {
       const vmNamesParsed = await this.parseRetrievePropertiesExResponse(vmNamesResponseXml, 'vm-name-lookup');
       const vmObjects = vmNamesParsed.objects;
       const normalizedVmObjects = Array.isArray(vmObjects) ? vmObjects : vmObjects ? [vmObjects] : [];
+      totalVmNamesFetched += normalizedVmObjects.length;
 
       for (const obj of normalizedVmObjects) {
         const objRef = obj.obj?._ ?? obj.obj;
@@ -613,6 +628,7 @@ export class VCenterSoapClient {
 
     logDebug('Matched VMs', {
       matchedCount: matchedVMs.length,
+      totalVmNamesFetched,
       samples: matchedVMs.slice(0, 5).map((ref) => nameMatches.get(ref)),
     });
 
