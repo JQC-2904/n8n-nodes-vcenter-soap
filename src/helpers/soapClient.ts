@@ -71,12 +71,15 @@ export class VCenterSoapClient {
   }
 
   private normalizeEndpoint(baseUrl: string): string {
-    const trimmed = baseUrl.replace(/\/+$/, '').replace(/\/sdk\/vimService\.wsdl$/i, '/sdk');
+    const trimmed = baseUrl
+      .replace(/\/+$/, '')
+      .replace(/\/sdk\/vimService\.wsdl$/i, '/sdk/vimService')
+      .replace(/\/sdk$/i, '/sdk/vimService');
     if (!/^https:\/\//i.test(trimmed)) {
       throw new Error('Only HTTPS endpoints are supported for SOAP transport.');
     }
-    if (trimmed.endsWith('/sdk')) return trimmed;
-    return `${trimmed}/sdk`;
+    if (trimmed.endsWith('/sdk/vimService')) return trimmed;
+    return `${trimmed}/sdk/vimService`;
   }
 
   private createHttpsAgent(): https.Agent {
@@ -144,6 +147,12 @@ export class VCenterSoapClient {
       maxRedirects: 0,
     });
 
+    if (response.status === 404) {
+      throw new Error(
+        'SOAP endpoint not reachable (404). Your Envoy/LB is not routing /sdk/vimService. Fix routing or use direct vCenter URL.',
+      );
+    }
+
     const setCookie = response.headers['set-cookie'];
     if (setCookie) {
       const session = setCookie.find((cookie: string) => cookie.startsWith('vmware_soap_session'));
@@ -157,8 +166,10 @@ export class VCenterSoapClient {
 
     if (response.status !== 200) {
       const bodySnippet = typeof response.data === 'string' ? response.data : JSON.stringify(response.data ?? '');
-      const fault = this.extractFaultString(bodySnippet);
-      const snippet = (fault ?? bodySnippet).slice(0, 500);
+      const snippet = (response.status === 500 ? this.extractFaultString(bodySnippet) ?? bodySnippet : bodySnippet).slice(
+        0,
+        500,
+      );
       throw new Error(
         `SOAP request failed (status ${response.status}) for ${this.endpoint} [SOAPAction: ${soapActionHeader}]: ${snippet}`,
       );
