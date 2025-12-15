@@ -1,4 +1,3 @@
-import axios, { AxiosInstance } from 'axios';
 import * as https from 'https';
 import { XMLBuilder, XMLParser } from 'fast-xml-parser';
 
@@ -41,11 +40,10 @@ const SOAP_ENV_NS = 'http://schemas.xmlsoap.org/soap/envelope/';
 const VIM_NS = 'urn:vim25';
 
 export class VCenterSoapClient {
-  private readonly http: AxiosInstance;
   private readonly options: SoapClientOptions;
   private readonly endpoint: string;
+  private readonly httpsAgent: https.Agent;
   private sessionCookie: string | null = null;
-  private static httpDebugLogged = false;
   private readonly parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '', removeNSPrefix: true });
   private readonly builder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '', suppressBooleanAttributes: false });
 
@@ -61,19 +59,7 @@ export class VCenterSoapClient {
     // - If allowInsecure is true, certificate verification is skipped for lab environments.
     // - If a custom CA is provided, it is injected while keeping verification enabled.
     // - Otherwise, Node.js default verification is used.
-    const httpsAgent = this.createHttpsAgent();
-
-    this.http = axios.create({
-      baseURL: this.endpoint,
-      timeout: options.timeout ?? 15000,
-      httpsAgent,
-      proxy: false,
-      maxRedirects: 0,
-      validateStatus: () => true,
-      responseType: 'text',
-      transformResponse: [(response: string) => response],
-      adapter: axios.defaults.adapter,
-    });
+    this.httpsAgent = this.createHttpsAgent();
   }
 
   private normalizeEndpoint(baseUrl: string): string {
@@ -89,10 +75,12 @@ export class VCenterSoapClient {
   }
 
   private createHttpsAgent(): https.Agent {
+    const url = new URL(this.endpoint);
     return new https.Agent({
       keepAlive: false,
       rejectUnauthorized: !this.options.allowInsecure,
       ca: this.options.caCertificate,
+      servername: url.hostname,
     });
   }
 
@@ -134,56 +122,93 @@ export class VCenterSoapClient {
     return match?.[1]?.trim();
   }
 
-  private async send(body: any, _soapAction?: string): Promise<any> {
-    const soapActionHeader = 'urn:vim25/7.0';
-    const soapBody = this.normalizeSoapBody(body);
+  private async sendRawHttp11(xml: string, soapAction: string): Promise<{ statusCode: number; headers: any; bodyText: string }> {
+    const soapBody = this.normalizeSoapBody(xml);
+    const url = new URL(this.endpoint);
+    const path = '/sdk/vimService';
+    const contentLength = Buffer.byteLength(soapBody, 'utf8');
     const headers: Record<string, string> = {
+      Host: url.host,
       'Content-Type': 'text/xml; charset=utf-8',
       Accept: 'text/xml',
-      SOAPAction: soapActionHeader,
+      SOAPAction: soapAction,
+      'Content-Length': contentLength.toString(),
+      Connection: 'close',
     };
-    headers['Content-Length'] = Buffer.byteLength(soapBody, 'utf8').toString();
 
     if (this.sessionCookie) {
       headers.Cookie = `vmware_soap_session=${this.sessionCookie}`;
     }
 
-    if (this.options.debugHttp && !VCenterSoapClient.httpDebugLogged) {
-      const adapter = this.http.defaults.adapter;
-      const adapterName = Array.isArray(adapter)
-        ? adapter.map((fn) => (typeof fn === 'function' ? fn.name || 'anonymous' : 'unknown')).join(', ')
-        : typeof adapter === 'function'
-          ? adapter.name || 'anonymous'
-          : 'unknown';
-
-      // One-time transport debug log to verify request fidelity.
+    if (this.options.debugHttp) {
       // eslint-disable-next-line no-console
-      console.debug('[vcenter-soap:http]', {
-        method: 'POST',
-        url: this.endpoint,
+      console.debug('[vcenter-soap:http:req]', {
+        startLine: `POST ${path} HTTP/1.1`,
         headers,
         bodyPreview: soapBody.slice(0, 120),
-        proxyDisabled: this.http.defaults.proxy === false,
-        adapter: adapterName,
       });
-
-      VCenterSoapClient.httpDebugLogged = true;
     }
 
-    const response = await this.http.post('', soapBody, {
-      headers,
-      maxRedirects: 0,
-    });
+    return new Promise((resolve, reject) => {
+      const req = https.request(
+        {
+          protocol: url.protocol,
+          hostname: url.hostname,
+          port: url.port || 443,
+          method: 'POST',
+          path,
+          headers,
+          agent: this.httpsAgent,
+          rejectUnauthorized: !this.options.allowInsecure,
+          timeout: this.options.timeout ?? 15000,
+        },
+        (res) => {
+          let data = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk) => {
+            data += chunk;
+          });
+          res.on('end', () => {
+            if (this.options.debugHttp) {
+              // eslint-disable-next-line no-console
+              console.debug('[vcenter-soap:http:res]', {
+                status: res.statusCode,
+                bodyPreview: data.slice(0, 200),
+              });
+            }
+            resolve({ statusCode: res.statusCode ?? 0, headers: res.headers, bodyText: data });
+          });
+        },
+      );
 
-    if (response.status === 404) {
+      req.on('error', (error) => reject(error));
+      req.on('timeout', () => {
+        req.destroy(new Error('SOAP request timed out'));
+      });
+
+      req.write(soapBody, 'utf8');
+      req.end();
+    });
+  }
+
+  private async send(body: any, soapAction = 'urn:vim25/7.0'): Promise<any> {
+    const soapBody = this.normalizeSoapBody(body);
+    const response = await this.sendRawHttp11(soapBody, soapAction);
+
+    if (response.statusCode === 404) {
       throw new Error(
         'SOAP endpoint not reachable (404). Your Envoy/LB is not routing /sdk/vimService. Fix routing or use direct vCenter URL.',
       );
     }
 
-    const setCookie = response.headers['set-cookie'];
-    if (setCookie) {
-      const session = setCookie.find((cookie: string) => cookie.startsWith('vmware_soap_session'));
+    const setCookieHeader = response.headers['set-cookie'];
+    const setCookies = Array.isArray(setCookieHeader)
+      ? setCookieHeader
+      : typeof setCookieHeader === 'string'
+        ? [setCookieHeader]
+        : [];
+    if (setCookies.length) {
+      const session = setCookies.find((cookie: string) => cookie.startsWith('vmware_soap_session'));
       if (session) {
         const match = session.match(/vmware_soap_session=([^;]+)/);
         if (match?.[1]) {
@@ -192,20 +217,20 @@ export class VCenterSoapClient {
       }
     }
 
-    if (response.status !== 200) {
-      const bodySnippet = typeof response.data === 'string' ? response.data : JSON.stringify(response.data ?? '');
-      const snippet = (response.status === 500 ? this.extractFaultString(bodySnippet) ?? bodySnippet : bodySnippet).slice(
+    if (response.statusCode !== 200) {
+      const bodySnippet = response.bodyText;
+      const snippet = (response.statusCode === 500 ? this.extractFaultString(bodySnippet) ?? bodySnippet : bodySnippet).slice(
         0,
         500,
       );
       throw new Error(
-        `SOAP request failed (status ${response.status}) for ${this.endpoint} [SOAPAction: ${soapActionHeader}]: ${snippet}`,
+        `SOAP request failed (status ${response.statusCode}) for ${this.endpoint} [SOAPAction: ${soapAction}]: ${snippet}`,
       );
     }
 
-    const parsed = this.parseResponse(response.data ?? '');
+    const parsed = this.parseResponse(response.bodyText ?? '');
     const bodyNode = parsed.envelope?.Body ?? parsed.envelope?.body;
-    if (!bodyNode) throw new Error(`Invalid SOAP response. Response snippet: ${(response.data ?? '').slice(0, 500)}`);
+    if (!bodyNode) throw new Error(`Invalid SOAP response. Response snippet: ${(response.bodyText ?? '').slice(0, 500)}`);
     return bodyNode;
   }
 

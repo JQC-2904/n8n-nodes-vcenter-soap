@@ -6,6 +6,7 @@ export interface SoapClientOptions {
     caCertificate?: string;
     timeout?: number;
     soapVersion?: string;
+    debugHttp?: boolean;
 }
 export interface RetrieveServiceContentResult {
     rootFolder: string;
@@ -28,9 +29,9 @@ export interface VmSummary {
     vmPathName?: string;
 }
 export declare class VCenterSoapClient {
-    private readonly http;
     private readonly options;
     private readonly endpoint;
+    private readonly httpsAgent;
     private sessionCookie;
     private readonly parser;
     private readonly builder;
@@ -41,6 +42,7 @@ export declare class VCenterSoapClient {
     private normalizeSoapBody;
     private parseResponse;
     private extractFaultString;
+    private sendRawHttp11;
     private send;
     retrieveServiceContent(): Promise<RetrieveServiceContentResult>;
     login(): Promise<LoginResult>;
