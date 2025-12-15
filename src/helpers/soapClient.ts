@@ -62,6 +62,8 @@ export class VCenterSoapClient {
       baseURL: this.endpoint,
       timeout: options.timeout ?? 15000,
       httpsAgent,
+      proxy: false,
+      maxRedirects: 0,
       validateStatus: () => true,
       responseType: 'text',
       transformResponse: [(response: string) => response],
@@ -112,18 +114,22 @@ export class VCenterSoapClient {
 
   private async send(body: any, soapAction?: string): Promise<any> {
     const envelope = typeof body === 'string' ? body : this.buildEnvelope(body);
+    const soapBody = (envelope instanceof Buffer ? envelope.toString('utf8') : String(envelope))
+      .replace(/^\uFEFF/, '')
+      .trim();
     const soapActionHeader = soapAction ?? 'urn:vim25/7.0';
     const headers: Record<string, string> = {
       'Content-Type': 'text/xml; charset=utf-8',
       Accept: 'text/xml',
       SOAPAction: soapActionHeader,
     };
+    headers['Content-Length'] = Buffer.byteLength(soapBody, 'utf8').toString();
 
     if (this.sessionCookie) {
       headers.Cookie = `vmware_soap_session=${this.sessionCookie}`;
     }
 
-    const response = await this.http.post('', envelope, { headers });
+    const response = await this.http.post('', soapBody, { headers });
 
     const setCookie = response.headers['set-cookie'];
     if (setCookie) {
