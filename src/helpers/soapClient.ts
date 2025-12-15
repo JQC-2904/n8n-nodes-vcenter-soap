@@ -1,4 +1,4 @@
-import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
+import axios, { AxiosInstance } from 'axios';
 import https from 'https';
 import { XMLBuilder, XMLParser } from 'fast-xml-parser';
 
@@ -42,6 +42,7 @@ const VIM_NS = 'urn:vim25';
 export class VCenterSoapClient {
   private readonly http: AxiosInstance;
   private readonly options: SoapClientOptions;
+  private readonly endpoint: string;
   private sessionCookie: string | null = null;
   private readonly parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '', removeNSPrefix: true });
   private readonly builder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '', suppressBooleanAttributes: false });
@@ -49,40 +50,36 @@ export class VCenterSoapClient {
   constructor(options: SoapClientOptions) {
     this.options = options;
 
+    this.endpoint = this.normalizeEndpoint(options.baseUrl);
+
     // TLS handling is explicit and scoped: use a custom https.Agent for SOAP requests only.
     // - If allowInsecure is true, certificate verification is skipped for lab environments.
     // - If a custom CA is provided, it is injected while keeping verification enabled.
     // - Otherwise, Node.js default verification is used.
     const httpsAgent = this.createHttpsAgent();
 
-    const axiosConfig: AxiosRequestConfig = {
-      baseURL: `${options.baseUrl.replace(/\/$/, '')}/sdk`,
+    this.http = axios.create({
+      baseURL: this.endpoint,
       timeout: options.timeout ?? 15000,
-      headers: {
-        'Content-Type': 'text/xml; charset=utf-8',
-      },
-    };
-
-    if (httpsAgent) {
-      axiosConfig.httpsAgent = httpsAgent;
-    }
-
-    this.http = axios.create(axiosConfig);
+      httpsAgent,
+      validateStatus: () => true,
+      responseType: 'text',
+      transformResponse: [(response) => response],
+    });
   }
 
-  private createHttpsAgent(): https.Agent | undefined {
-    if (this.options.allowInsecure) {
-      return new https.Agent({ rejectUnauthorized: false });
-    }
+  private normalizeEndpoint(baseUrl: string): string {
+    const trimmed = baseUrl.replace(/\/+$/, '').replace(/\/sdk\/vimService\.wsdl$/i, '/sdk');
+    if (trimmed.endsWith('/sdk')) return trimmed;
+    return `${trimmed}/sdk`;
+  }
 
-    if (this.options.caCertificate) {
-      return new https.Agent({
-        ca: this.options.caCertificate,
-        rejectUnauthorized: true,
-      });
-    }
-
-    return undefined;
+  private createHttpsAgent(): https.Agent {
+    return new https.Agent({
+      keepAlive: true,
+      rejectUnauthorized: !this.options.allowInsecure,
+      ca: this.options.caCertificate,
+    });
   }
 
   private buildEnvelope(body: any) {
@@ -96,18 +93,34 @@ export class VCenterSoapClient {
   }
 
   private parseResponse(xml: string): ParsedSoapResponse {
-    const envelope = this.parser.parse(xml)['Envelope'] ?? this.parser.parse(xml)['soapenv:Envelope'];
-    return { envelope };
+    try {
+      const parsed = this.parser.parse(xml);
+      const envelope = parsed?.Envelope ?? parsed?.['soapenv:Envelope'] ?? parsed?.['SOAP-ENV:Envelope'];
+      if (!envelope) throw new Error('SOAP Envelope not found');
+      return { envelope };
+    } catch (error) {
+      const snippet = xml.slice(0, 500);
+      const message = error instanceof Error ? error.message : 'Unknown parsing error';
+      throw new Error(`Failed to parse SOAP response: ${message}. Response snippet: ${snippet}`);
+    }
   }
 
-  private async send(body: any, soapAction: string): Promise<any> {
-    const envelope = this.buildEnvelope(body);
+  private extractFaultString(xml: string): string | undefined {
+    const match = xml.match(/<faultstring[^>]*>([\s\S]*?)<\/faultstring>/i);
+    return match?.[1]?.trim();
+  }
+
+  private async send(body: any, soapAction?: string): Promise<any> {
+    const envelope = typeof body === 'string' ? body : this.buildEnvelope(body);
+    const soapActionHeader = soapAction ?? 'urn:vim25/7.0';
     const headers: Record<string, string> = {
-      SOAPAction: `urn:vim25/${soapAction}`,
+      'Content-Type': 'text/xml; charset=utf-8',
+      Accept: 'text/xml',
+      SOAPAction: soapActionHeader,
     };
 
     if (this.sessionCookie) {
-      headers.Cookie = this.sessionCookie;
+      headers.Cookie = `vmware_soap_session=${this.sessionCookie}`;
     }
 
     const response = await this.http.post('', envelope, { headers });
@@ -116,27 +129,39 @@ export class VCenterSoapClient {
     if (setCookie) {
       const session = setCookie.find((cookie) => cookie.startsWith('vmware_soap_session'));
       if (session) {
-        this.sessionCookie = session.split(';')[0];
+        const match = session.match(/vmware_soap_session=([^;]+)/);
+        if (match?.[1]) {
+          this.sessionCookie = match[1];
+        }
       }
     }
 
-    const parsed = this.parseResponse(response.data);
+    if (response.status !== 200) {
+      const bodySnippet = typeof response.data === 'string' ? response.data : JSON.stringify(response.data ?? '');
+      const fault = this.extractFaultString(bodySnippet);
+      const snippet = (fault ?? bodySnippet).slice(0, 500);
+      throw new Error(
+        `SOAP request failed (status ${response.status}) for ${this.endpoint} [SOAPAction: ${soapActionHeader}]: ${snippet}`,
+      );
+    }
+
+    const parsed = this.parseResponse(response.data ?? '');
     const bodyNode = parsed.envelope?.Body ?? parsed.envelope?.body;
-    if (!bodyNode) throw new Error('Invalid SOAP response');
+    if (!bodyNode) throw new Error(`Invalid SOAP response. Response snippet: ${(response.data ?? '').slice(0, 500)}`);
     return bodyNode;
   }
 
   async retrieveServiceContent(): Promise<RetrieveServiceContentResult> {
-    const body = {
+    const envelope = this.buildEnvelope({
       'urn:RetrieveServiceContent': {
         'urn:_this': {
           '@_type': 'ServiceInstance',
           '#text': 'ServiceInstance',
         },
       },
-    };
+    });
 
-    const response = await this.send(body, 'RetrieveServiceContent');
+    const response = await this.send(envelope, 'urn:vim25/7.0');
     const result = response.RetrieveServiceContentResponse?.returnval ?? response.retrieveServiceContentResponse?.returnval;
     if (!result) throw new Error('Missing RetrieveServiceContent response');
 
@@ -157,7 +182,7 @@ export class VCenterSoapClient {
       },
     };
 
-    const response = await this.send(body, 'Login');
+    const response = await this.send(body, 'urn:vim25/7.0');
     const cookie = this.sessionCookie ?? '';
     if (!cookie) throw new Error('Login did not return a session cookie');
     return { sessionCookie: cookie };
@@ -252,17 +277,21 @@ export class VCenterSoapClient {
   }
 
   async testConnection(): Promise<Record<string, any>> {
-    const firstContent = await this.retrieveServiceContent();
-    await this.login();
-    const secondContent = await this.retrieveServiceContent();
-    return {
-      apiType: secondContent.about.apiType,
-      fullName: secondContent.about.fullName,
-      version: secondContent.about.version,
-      build: secondContent.about.build,
-      rootFolder: secondContent.rootFolder,
-      authenticated: true,
-    };
+    try {
+      const firstContent = await this.retrieveServiceContent();
+      await this.login();
+      const secondContent = await this.retrieveServiceContent();
+      return {
+        apiType: secondContent.about.apiType,
+        fullName: secondContent.about.fullName,
+        version: secondContent.about.version,
+        build: secondContent.about.build,
+        rootFolder: secondContent.rootFolder,
+        authenticated: true,
+      };
+    } catch (error) {
+      throw error;
+    }
   }
 
   async findVmsByName(options: {

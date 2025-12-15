@@ -30,13 +30,16 @@ export interface VmSummary {
 export declare class VCenterSoapClient {
     private readonly http;
     private readonly options;
+    private readonly endpoint;
     private sessionCookie;
     private readonly parser;
     private readonly builder;
     constructor(options: SoapClientOptions);
+    private normalizeEndpoint;
     private createHttpsAgent;
     private buildEnvelope;
     private parseResponse;
+    private extractFaultString;
     private send;
     retrieveServiceContent(): Promise<RetrieveServiceContentResult>;
     login(): Promise<LoginResult>;
