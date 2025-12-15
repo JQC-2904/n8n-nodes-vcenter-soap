@@ -32,12 +32,8 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.VCenterSoapClient = void 0;
-const axios_1 = __importDefault(require("axios"));
 const https = __importStar(require("https"));
 const fast_xml_parser_1 = require("fast-xml-parser");
 const SOAP_ENV_NS = 'http://schemas.xmlsoap.org/soap/envelope/';
@@ -49,21 +45,13 @@ class VCenterSoapClient {
         this.builder = new fast_xml_parser_1.XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '', suppressBooleanAttributes: false });
         this.options = { allowInsecure: true, ...options };
         this.endpoint = this.normalizeEndpoint(options.baseUrl);
+        // Explicitly disable all proxy behaviour for SOAP calls.
+        process.env.NO_PROXY = '*';
         // TLS handling is explicit and scoped: use a custom https.Agent for SOAP requests only.
         // - If allowInsecure is true, certificate verification is skipped for lab environments.
         // - If a custom CA is provided, it is injected while keeping verification enabled.
         // - Otherwise, Node.js default verification is used.
-        const httpsAgent = this.createHttpsAgent();
-        this.http = axios_1.default.create({
-            baseURL: this.endpoint,
-            timeout: options.timeout ?? 15000,
-            httpsAgent,
-            proxy: false,
-            maxRedirects: 0,
-            validateStatus: () => true,
-            responseType: 'text',
-            transformResponse: [(response) => response],
-        });
+        this.httpsAgent = this.createHttpsAgent();
     }
     normalizeEndpoint(baseUrl) {
         const trimmed = baseUrl
@@ -78,10 +66,12 @@ class VCenterSoapClient {
         return `${trimmed}/sdk/vimService`;
     }
     createHttpsAgent() {
+        const url = new URL(this.endpoint);
         return new https.Agent({
             keepAlive: false,
             rejectUnauthorized: !this.options.allowInsecure,
             ca: this.options.caCertificate,
+            servername: url.hostname,
         });
     }
     buildEnvelope(body) {
@@ -96,7 +86,7 @@ class VCenterSoapClient {
     normalizeSoapBody(body) {
         const envelope = typeof body === 'string' ? body : this.buildEnvelope(body);
         const soapBody = (envelope instanceof Buffer ? envelope.toString('utf8') : String(envelope)).replace(/^\uFEFF/, '');
-        const normalized = soapBody.replace(/^\s+/, '');
+        const normalized = soapBody.trim();
         if (!normalized.startsWith('<')) {
             throw new Error('SOAP body must start with "<" after normalization.');
         }
@@ -120,28 +110,80 @@ class VCenterSoapClient {
         const match = xml.match(/<faultstring[^>]*>([\s\S]*?)<\/faultstring>/i);
         return match?.[1]?.trim();
     }
-    async send(body, _soapAction) {
-        const soapActionHeader = 'urn:vim25/7.0';
-        const soapBody = this.normalizeSoapBody(body);
+    async sendRawHttp11(xml, soapAction) {
+        const soapBody = this.normalizeSoapBody(xml);
+        const url = new URL(this.endpoint);
+        const path = '/sdk/vimService';
+        const contentLength = Buffer.byteLength(soapBody, 'utf8');
         const headers = {
+            Host: url.host,
             'Content-Type': 'text/xml; charset=utf-8',
             Accept: 'text/xml',
-            SOAPAction: soapActionHeader,
+            SOAPAction: soapAction,
+            'Content-Length': contentLength.toString(),
+            Connection: 'close',
         };
-        headers['Content-Length'] = Buffer.byteLength(soapBody, 'utf8').toString();
         if (this.sessionCookie) {
             headers.Cookie = `vmware_soap_session=${this.sessionCookie}`;
         }
-        const response = await this.http.post('', soapBody, {
-            headers,
-            maxRedirects: 0,
+        if (this.options.debugHttp) {
+            // eslint-disable-next-line no-console
+            console.debug('[vcenter-soap:http:req]', {
+                startLine: `POST ${path} HTTP/1.1`,
+                headers,
+                bodyPreview: soapBody.slice(0, 120),
+            });
+        }
+        return new Promise((resolve, reject) => {
+            const req = https.request({
+                protocol: url.protocol,
+                hostname: url.hostname,
+                port: url.port || 443,
+                method: 'POST',
+                path,
+                headers,
+                agent: this.httpsAgent,
+                rejectUnauthorized: !this.options.allowInsecure,
+                timeout: this.options.timeout ?? 15000,
+            }, (res) => {
+                let data = '';
+                res.setEncoding('utf8');
+                res.on('data', (chunk) => {
+                    data += chunk;
+                });
+                res.on('end', () => {
+                    if (this.options.debugHttp) {
+                        // eslint-disable-next-line no-console
+                        console.debug('[vcenter-soap:http:res]', {
+                            status: res.statusCode,
+                            bodyPreview: data.slice(0, 200),
+                        });
+                    }
+                    resolve({ statusCode: res.statusCode ?? 0, headers: res.headers, bodyText: data });
+                });
+            });
+            req.on('error', (error) => reject(error));
+            req.on('timeout', () => {
+                req.destroy(new Error('SOAP request timed out'));
+            });
+            req.write(soapBody, 'utf8');
+            req.end();
         });
-        if (response.status === 404) {
+    }
+    async send(body, soapAction = 'urn:vim25/7.0') {
+        const soapBody = this.normalizeSoapBody(body);
+        const response = await this.sendRawHttp11(soapBody, soapAction);
+        if (response.statusCode === 404) {
             throw new Error('SOAP endpoint not reachable (404). Your Envoy/LB is not routing /sdk/vimService. Fix routing or use direct vCenter URL.');
         }
-        const setCookie = response.headers['set-cookie'];
-        if (setCookie) {
-            const session = setCookie.find((cookie) => cookie.startsWith('vmware_soap_session'));
+        const setCookieHeader = response.headers['set-cookie'];
+        const setCookies = Array.isArray(setCookieHeader)
+            ? setCookieHeader
+            : typeof setCookieHeader === 'string'
+                ? [setCookieHeader]
+                : [];
+        if (setCookies.length) {
+            const session = setCookies.find((cookie) => cookie.startsWith('vmware_soap_session'));
             if (session) {
                 const match = session.match(/vmware_soap_session=([^;]+)/);
                 if (match?.[1]) {
@@ -149,15 +191,15 @@ class VCenterSoapClient {
                 }
             }
         }
-        if (response.status !== 200) {
-            const bodySnippet = typeof response.data === 'string' ? response.data : JSON.stringify(response.data ?? '');
-            const snippet = (response.status === 500 ? this.extractFaultString(bodySnippet) ?? bodySnippet : bodySnippet).slice(0, 500);
-            throw new Error(`SOAP request failed (status ${response.status}) for ${this.endpoint} [SOAPAction: ${soapActionHeader}]: ${snippet}`);
+        if (response.statusCode !== 200) {
+            const bodySnippet = response.bodyText;
+            const snippet = (response.statusCode === 500 ? this.extractFaultString(bodySnippet) ?? bodySnippet : bodySnippet).slice(0, 500);
+            throw new Error(`SOAP request failed (status ${response.statusCode}) for ${this.endpoint} [SOAPAction: ${soapAction}]: ${snippet}`);
         }
-        const parsed = this.parseResponse(response.data ?? '');
+        const parsed = this.parseResponse(response.bodyText ?? '');
         const bodyNode = parsed.envelope?.Body ?? parsed.envelope?.body;
         if (!bodyNode)
-            throw new Error(`Invalid SOAP response. Response snippet: ${(response.data ?? '').slice(0, 500)}`);
+            throw new Error(`Invalid SOAP response. Response snippet: ${(response.bodyText ?? '').slice(0, 500)}`);
         return bodyNode;
     }
     async retrieveServiceContent() {
