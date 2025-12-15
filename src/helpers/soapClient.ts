@@ -105,35 +105,43 @@ export class VCenterSoapClient {
   }
 
   private buildEnvelope(innerXml: string): string {
-    const normalizedInnerXml = this.ensureRetrievePropertiesExOptions(innerXml);
-
     return [
       '<?xml version="1.0" encoding="UTF-8"?>',
       '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:vim25">',
       '  <soapenv:Body>',
-      normalizedInnerXml,
+      innerXml,
       '  </soapenv:Body>',
       '</soapenv:Envelope>',
     ].join('\n');
   }
 
-  private ensureRetrievePropertiesExOptions(innerXml: string): string {
-    const retrieveRegex = /<RetrievePropertiesEx\b[^>]*>[\s\S]*?<\/RetrievePropertiesEx>/m;
-    const match = innerXml.match(retrieveRegex);
-    if (!match) {
-      return innerXml;
-    }
+  private buildRetrievePropertiesExBody(params: {
+    propertyCollector: string;
+    propType: string;
+    pathSets: string[];
+    objects: Array<{ type: string; ref: string }>;
+  }): string {
+    const propSetXml = [
+      '      <specSet>',
+      '        <propSet>',
+      `          <type>${params.propType}</type>`,
+      ...params.pathSets.map((path) => `          <pathSet>${path}</pathSet>`),
+      '        </propSet>',
+      ...params.objects.map((obj) =>
+        ['        <objectSet>', `          <obj type="${obj.type}">${obj.ref}</obj>`, '        </objectSet>'].join('\n'),
+      ),
+      '      </specSet>',
+    ].join('\n');
 
-    const retrieveBlock = match[0];
-    const hasOptions = /<\/?(?:urn:)?options\b/i.test(retrieveBlock);
-    if (hasOptions) {
-      return innerXml;
-    }
+    const innerXml = [
+      '    <RetrievePropertiesEx xmlns="urn:vim25">',
+      `      <_this type="PropertyCollector">${params.propertyCollector}</_this>`,
+      propSetXml,
+      '      <options/>',
+      '    </RetrievePropertiesEx>',
+    ].join('\n');
 
-    const optionsElement = '      <options/>';
-    const retrieveWithOptions = retrieveBlock.replace('</RetrievePropertiesEx>', `${optionsElement}\n    </RetrievePropertiesEx>`);
-
-    return innerXml.replace(retrieveBlock, retrieveWithOptions);
+    return this.buildEnvelope(innerXml);
   }
 
   private escapeXml(value: string): string {
@@ -267,7 +275,83 @@ export class VCenterSoapClient {
     return body;
   }
 
-  private extractValMoRefs(xml: string): Array<{ moRef: string; type?: string }> {
+  private async parseRetrievePropertiesExResponse(
+    xml: string,
+    context: string,
+  ): Promise<{ objects: any[]; moRefs: Array<{ moRef: string; type?: string }> }> {
+    const body = await this.parseSoapBody(xml);
+    const response = body?.RetrievePropertiesExResponse;
+    const returnVal = response?.returnval;
+    const rawObjects = returnVal?.objects;
+    const objects = Array.isArray(rawObjects) ? rawObjects : rawObjects ? [rawObjects] : [];
+
+    const moRefs: Array<{ moRef: string; type?: string }> = [];
+    let propSetCount = 0;
+
+    for (const obj of objects) {
+      const propSets = Array.isArray(obj.propSet) ? obj.propSet : obj.propSet ? [obj.propSet] : [];
+      propSetCount += propSets.length;
+
+      for (const prop of propSets) {
+        moRefs.push(...this.extractMoRefsFromProp(prop));
+      }
+    }
+
+    const rawValMoRefs = this.extractValElementsFromXml(xml);
+    for (const rawRef of rawValMoRefs) {
+      if (!moRefs.find((existing) => existing.moRef === rawRef.moRef)) {
+        moRefs.push(rawRef);
+      }
+    }
+
+    if (this.config.debug) {
+      this.logDebug('RetrievePropertiesEx response', {
+        context,
+        rawSnippet: xml.substring(0, 500),
+        counts: { objects: objects.length, propSets: propSetCount, extractedMoRefs: moRefs.length },
+        sampleMoRefs: moRefs.slice(0, 10).map((entry) => entry.moRef),
+      });
+    }
+
+    return { objects, moRefs };
+  }
+
+  private extractMoRefsFromProp(prop: any): Array<{ moRef: string; type?: string }> {
+    const results: Array<{ moRef: string; type?: string }> = [];
+    if (!prop) {
+      return results;
+    }
+
+    const handleVal = (value: any) => {
+      if (Array.isArray(value)) {
+        value.forEach(handleVal);
+        return;
+      }
+
+      if (typeof value === 'string') {
+        results.push({ moRef: value, type: this.normalizeMoRefType(undefined, value) });
+        return;
+      }
+
+      if (value && typeof value === 'object') {
+        const moRef = typeof value._ === 'string' ? value._ : typeof value.val === 'string' ? value.val : value.value;
+        const type = typeof value.type === 'string' ? value.type : undefined;
+        if (typeof moRef === 'string') {
+          results.push({ moRef, type: this.normalizeMoRefType(type, moRef) });
+        } else if (value.val !== undefined && value.val !== value) {
+          handleVal(value.val);
+        }
+      }
+    };
+
+    if (prop.val !== undefined) {
+      handleVal(prop.val);
+    }
+
+    return results;
+  }
+
+  private extractValElementsFromXml(xml: string): Array<{ moRef: string; type?: string }> {
     const results: Array<{ moRef: string; type?: string }> = [];
     const regex = /<val\b([^>]*)>([^<]+)<\/val>/gi;
     let match: RegExpExecArray | null;
@@ -287,10 +371,28 @@ export class VCenterSoapClient {
         }
       }
 
-      results.push({ moRef, type });
+      results.push({ moRef, type: this.normalizeMoRefType(type, moRef) });
     }
 
     return results;
+  }
+
+  private normalizeMoRefType(type: string | undefined, moRef: string): string | undefined {
+    if (type && type !== 'ManagedObjectReference') {
+      return type;
+    }
+
+    if (moRef.startsWith('datacenter-')) {
+      return 'Datacenter';
+    }
+    if (moRef.startsWith('group-v')) {
+      return 'Folder';
+    }
+    if (moRef.startsWith('vm-')) {
+      return 'VirtualMachine';
+    }
+
+    return type;
   }
 
   private chunkArray<T>(items: T[], size: number): T[][] {
@@ -335,15 +437,19 @@ export class VCenterSoapClient {
       propertyCollector: serviceContent.propertyCollector,
     });
 
-    const datacenterDiscoveryXml = this.buildEnvelope(`    <RetrievePropertiesEx xmlns="urn:vim25">\n      <_this type="PropertyCollector">${serviceContent.propertyCollector}</_this>\n      <specSet>\n        <propSet>\n          <type>Folder</type>\n          <pathSet>childEntity</pathSet>\n        </propSet>\n        <objectSet>\n          <obj type="Folder">${serviceContent.rootFolder}</obj>\n        </objectSet>\n      </specSet>\n    </RetrievePropertiesEx>`);
+    const datacenterDiscoveryXml = this.buildRetrievePropertiesExBody({
+      propertyCollector: serviceContent.propertyCollector,
+      propType: 'Folder',
+      pathSets: ['childEntity'],
+      objects: [{ type: 'Folder', ref: serviceContent.rootFolder }],
+    });
     const datacenterDiscoveryResponseXml = await this.sendSoapRequest(datacenterDiscoveryXml);
-    const datacenterDiscoveryParsed = await this.parseSoapBody(datacenterDiscoveryResponseXml);
-    if (!datacenterDiscoveryParsed?.RetrievePropertiesExResponse) {
-      throw new Error('Unexpected response when discovering datacenters');
-    }
+    const datacenterDiscoveryParsed = await this.parseRetrievePropertiesExResponse(
+      datacenterDiscoveryResponseXml,
+      'datacenter-discovery',
+    );
 
-    const datacenterCandidates = this.extractValMoRefs(datacenterDiscoveryResponseXml);
-    const datacenterMoRefs = datacenterCandidates
+    const datacenterMoRefs = datacenterDiscoveryParsed.moRefs
       .filter((entry) => entry.type === 'Datacenter' || entry.moRef.startsWith('datacenter-'))
       .map((entry) => entry.moRef);
 
@@ -358,15 +464,21 @@ export class VCenterSoapClient {
     const visitedVMs = new Set<string>();
 
     for (const datacenterMoRef of datacenterMoRefs) {
-      const dcDetailsXml = this.buildEnvelope(`    <RetrievePropertiesEx xmlns="urn:vim25">\n      <_this type="PropertyCollector">${serviceContent.propertyCollector}</_this>\n      <specSet>\n        <propSet>\n          <type>Datacenter</type>\n          <pathSet>name</pathSet>\n          <pathSet>vmFolder</pathSet>\n        </propSet>\n        <objectSet>\n          <obj type="Datacenter">${datacenterMoRef}</obj>\n        </objectSet>\n      </specSet>\n    </RetrievePropertiesEx>`);
+      const dcDetailsXml = this.buildRetrievePropertiesExBody({
+        propertyCollector: serviceContent.propertyCollector,
+        propType: 'Datacenter',
+        pathSets: ['name', 'vmFolder'],
+        objects: [{ type: 'Datacenter', ref: datacenterMoRef }],
+      });
 
       const dcDetailsResponseXml = await this.sendSoapRequest(dcDetailsXml);
-      const dcDetailsParsed = await this.parseSoapBody(dcDetailsResponseXml);
-      const dcObjects =
-        dcDetailsParsed?.RetrievePropertiesExResponse?.returnval?.objects ??
-        dcDetailsParsed?.RetrievePropertiesExResponse?.returnval?.objects;
+      const dcDetailsParsed = await this.parseRetrievePropertiesExResponse(dcDetailsResponseXml, 'datacenter-details');
 
-      const normalizedDcObjects = Array.isArray(dcObjects) ? dcObjects : dcObjects ? [dcObjects] : [];
+      const normalizedDcObjects = Array.isArray(dcDetailsParsed.objects)
+        ? dcDetailsParsed.objects
+        : dcDetailsParsed.objects
+          ? [dcDetailsParsed.objects]
+          : [];
       let datacenterName = datacenterMoRef;
       let vmFolderMoRef: string | undefined;
 
@@ -385,8 +497,7 @@ export class VCenterSoapClient {
       }
 
       if (!vmFolderMoRef) {
-        const vmFolderCandidates = this.extractValMoRefs(dcDetailsResponseXml);
-        vmFolderMoRef = vmFolderCandidates.find((entry) => entry.moRef.startsWith('group-v'))?.moRef;
+        vmFolderMoRef = dcDetailsParsed.moRefs.find((entry) => entry.moRef.startsWith('group-v'))?.moRef;
       }
 
       if (!vmFolderMoRef) {
@@ -411,12 +522,20 @@ export class VCenterSoapClient {
         visitedFolders.add(folderMoRef);
         foldersVisitedForDc += 1;
 
-        const folderChildrenXml = this.buildEnvelope(`    <RetrievePropertiesEx xmlns="urn:vim25">\n      <_this type="PropertyCollector">${serviceContent.propertyCollector}</_this>\n      <specSet>\n        <propSet>\n          <type>Folder</type>\n          <pathSet>childEntity</pathSet>\n        </propSet>\n        <objectSet>\n          <obj type="Folder">${folderMoRef}</obj>\n        </objectSet>\n      </specSet>\n    </RetrievePropertiesEx>`);
+        const folderChildrenXml = this.buildRetrievePropertiesExBody({
+          propertyCollector: serviceContent.propertyCollector,
+          propType: 'Folder',
+          pathSets: ['childEntity'],
+          objects: [{ type: 'Folder', ref: folderMoRef }],
+        });
 
         const folderChildrenResponseXml = await this.sendSoapRequest(folderChildrenXml);
-        await this.parseSoapBody(folderChildrenResponseXml);
+        const folderChildrenParsed = await this.parseRetrievePropertiesExResponse(
+          folderChildrenResponseXml,
+          'folder-children',
+        );
 
-        const childEntries = this.extractValMoRefs(folderChildrenResponseXml);
+        const childEntries = folderChildrenParsed.moRefs;
         for (const child of childEntries) {
           const childMoRef = child.moRef;
           const childType = child.type;
@@ -455,23 +574,16 @@ export class VCenterSoapClient {
         break;
       }
 
-      const specSet = [
-        '      <specSet>',
-        '        <propSet>',
-        '          <type>VirtualMachine</type>',
-        '          <pathSet>name</pathSet>',
-        '        </propSet>',
-        '        <objectSet>',
-        vmChunk.map((vmRef) => `          <obj type="VirtualMachine">${vmRef}</obj>`).join('\n'),
-        '        </objectSet>',
-        '      </specSet>',
-      ].join('\n');
-
-      const vmNamesXml = this.buildEnvelope(`    <RetrievePropertiesEx xmlns="urn:vim25">\n      <_this type="PropertyCollector">${serviceContent.propertyCollector}</_this>\n${specSet}\n    </RetrievePropertiesEx>`);
+      const vmNamesXml = this.buildRetrievePropertiesExBody({
+        propertyCollector: serviceContent.propertyCollector,
+        propType: 'VirtualMachine',
+        pathSets: ['name'],
+        objects: vmChunk.map((vmRef) => ({ type: 'VirtualMachine', ref: vmRef })),
+      });
 
       const vmNamesResponseXml = await this.sendSoapRequest(vmNamesXml);
-      const vmNamesParsed = await this.parseSoapBody(vmNamesResponseXml);
-      const vmObjects = vmNamesParsed?.RetrievePropertiesExResponse?.returnval?.objects;
+      const vmNamesParsed = await this.parseRetrievePropertiesExResponse(vmNamesResponseXml, 'vm-name-lookup');
+      const vmObjects = vmNamesParsed.objects;
       const normalizedVmObjects = Array.isArray(vmObjects) ? vmObjects : vmObjects ? [vmObjects] : [];
 
       for (const obj of normalizedVmObjects) {
@@ -520,32 +632,16 @@ export class VCenterSoapClient {
     const matchedChunks = this.chunkArray(matchedVMs, 100);
 
     for (const matchChunk of matchedChunks) {
-      const propSetXml = [
-        '        <propSet>',
-        '          <type>VirtualMachine</type>',
-        ...pathSets.map((path) => `          <pathSet>${path}</pathSet>`),
-        '        </propSet>',
-      ].join('\n');
-
-      const objectSetXml = matchChunk
-        .map((vmRef) => `          <objectSet>\n            <obj type="VirtualMachine">${vmRef}</obj>\n          </objectSet>`) // keep structure per object
-        .join('\n');
-
-      const vmDetailsXml = this.buildEnvelope(
-        [
-          '    <RetrievePropertiesEx xmlns="urn:vim25">',
-          `      <_this type="PropertyCollector">${serviceContent.propertyCollector}</_this>`,
-          '      <specSet>',
-          propSetXml,
-          objectSetXml,
-          '      </specSet>',
-          '    </RetrievePropertiesEx>',
-        ].join('\n'),
-      );
+      const vmDetailsXml = this.buildRetrievePropertiesExBody({
+        propertyCollector: serviceContent.propertyCollector,
+        propType: 'VirtualMachine',
+        pathSets,
+        objects: matchChunk.map((vmRef) => ({ type: 'VirtualMachine', ref: vmRef })),
+      });
 
       const vmDetailsResponseXml = await this.sendSoapRequest(vmDetailsXml);
-      const vmDetailsParsed = await this.parseSoapBody(vmDetailsResponseXml);
-      const vmObjects = vmDetailsParsed?.RetrievePropertiesExResponse?.returnval?.objects;
+      const vmDetailsParsed = await this.parseRetrievePropertiesExResponse(vmDetailsResponseXml, 'vm-details');
+      const vmObjects = vmDetailsParsed.objects;
       const normalizedVmObjects = Array.isArray(vmObjects) ? vmObjects : vmObjects ? [vmObjects] : [];
 
       for (const obj of normalizedVmObjects) {
