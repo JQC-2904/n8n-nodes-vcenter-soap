@@ -10,6 +10,7 @@ export interface SoapClientOptions {
   caCertificate?: string;
   timeout?: number;
   soapVersion?: string;
+  debugHttp?: boolean;
 }
 
 export interface RetrieveServiceContentResult {
@@ -44,6 +45,7 @@ export class VCenterSoapClient {
   private readonly options: SoapClientOptions;
   private readonly endpoint: string;
   private sessionCookie: string | null = null;
+  private static httpDebugLogged = false;
   private readonly parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '', removeNSPrefix: true });
   private readonly builder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '', suppressBooleanAttributes: false });
 
@@ -51,6 +53,9 @@ export class VCenterSoapClient {
     this.options = { allowInsecure: true, ...options };
 
     this.endpoint = this.normalizeEndpoint(options.baseUrl);
+
+    // Explicitly disable all proxy behaviour for SOAP calls.
+    process.env.NO_PROXY = '*';
 
     // TLS handling is explicit and scoped: use a custom https.Agent for SOAP requests only.
     // - If allowInsecure is true, certificate verification is skipped for lab environments.
@@ -67,6 +72,7 @@ export class VCenterSoapClient {
       validateStatus: () => true,
       responseType: 'text',
       transformResponse: [(response: string) => response],
+      adapter: axios.defaults.adapter,
     });
   }
 
@@ -103,7 +109,7 @@ export class VCenterSoapClient {
   private normalizeSoapBody(body: any): string {
     const envelope = typeof body === 'string' ? body : this.buildEnvelope(body);
     const soapBody = (envelope instanceof Buffer ? envelope.toString('utf8') : String(envelope)).replace(/^\uFEFF/, '');
-    const normalized = soapBody.replace(/^\s+/, '');
+    const normalized = soapBody.trim();
     if (!normalized.startsWith('<')) {
       throw new Error('SOAP body must start with "<" after normalization.');
     }
@@ -140,6 +146,28 @@ export class VCenterSoapClient {
 
     if (this.sessionCookie) {
       headers.Cookie = `vmware_soap_session=${this.sessionCookie}`;
+    }
+
+    if (this.options.debugHttp && !VCenterSoapClient.httpDebugLogged) {
+      const adapter = this.http.defaults.adapter;
+      const adapterName = Array.isArray(adapter)
+        ? adapter.map((fn) => (typeof fn === 'function' ? fn.name || 'anonymous' : 'unknown')).join(', ')
+        : typeof adapter === 'function'
+          ? adapter.name || 'anonymous'
+          : 'unknown';
+
+      // One-time transport debug log to verify request fidelity.
+      // eslint-disable-next-line no-console
+      console.debug('[vcenter-soap:http]', {
+        method: 'POST',
+        url: this.endpoint,
+        headers,
+        bodyPreview: soapBody.slice(0, 120),
+        proxyDisabled: this.http.defaults.proxy === false,
+        adapter: adapterName,
+      });
+
+      VCenterSoapClient.httpDebugLogged = true;
     }
 
     const response = await this.http.post('', soapBody, {
