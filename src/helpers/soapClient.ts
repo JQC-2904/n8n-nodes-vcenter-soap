@@ -21,7 +21,11 @@ interface RetrieveServiceContentResult {
     build?: string;
   };
   sessionManager: string;
+  rootFolder?: string;
+  propertyCollector?: string;
 }
+
+type MatchMode = 'exact' | 'contains';
 
 export class VCenterSoapClient {
   private readonly endpoint: URL;
@@ -81,6 +85,8 @@ export class VCenterSoapClient {
         build: result.about.build,
       },
       sessionManager: result.sessionManager._ ?? result.sessionManager,
+      rootFolder: result.rootFolder?._ ?? result.rootFolder,
+      propertyCollector: result.propertyCollector?._ ?? result.propertyCollector,
     };
   }
 
@@ -238,6 +244,332 @@ export class VCenterSoapClient {
     }
 
     return body;
+  }
+
+  private extractValMoRefs(xml: string): Array<{ moRef: string; type?: string }> {
+    const results: Array<{ moRef: string; type?: string }> = [];
+    const regex = /<val\b([^>]*)>([^<]+)<\/val>/gi;
+    let match: RegExpExecArray | null;
+
+    while ((match = regex.exec(xml))) {
+      const attrs = match[1];
+      const moRef = match[2].trim();
+      if (!moRef) {
+        continue;
+      }
+
+      let type: string | undefined;
+      if (attrs) {
+        const typeMatch = attrs.match(/type="([^"]+)"/i);
+        if (typeMatch) {
+          type = typeMatch[1];
+        }
+      }
+
+      results.push({ moRef, type });
+    }
+
+    return results;
+  }
+
+  private chunkArray<T>(items: T[], size: number): T[][] {
+    const chunks: T[][] = [];
+    for (let i = 0; i < items.length; i += size) {
+      chunks.push(items.slice(i, i + size));
+    }
+    return chunks;
+  }
+
+  async searchVMByName(params: {
+    nameQuery: string;
+    matchMode: MatchMode;
+    maxResults: number;
+    includePowerState: boolean;
+    includeUuidAndPath: boolean;
+    debug?: boolean;
+  }): Promise<Array<Record<string, unknown>>> {
+    const debugEnabled = this.config.debug || params.debug;
+    const logger = this.config.logger ?? console.log;
+    const logDebug = (message: string, details: Record<string, unknown>) => {
+      if (debugEnabled) {
+        logger(`${message}: ${JSON.stringify(details)}`);
+      }
+    };
+
+    const initialContent = await this.retrieveServiceContent();
+    if (!initialContent.sessionManager) {
+      throw new Error('SessionManager reference not found');
+    }
+    if (!this.sessionCookie) {
+      await this.login(initialContent.sessionManager);
+    }
+    const serviceContent = this.sessionCookie ? await this.retrieveServiceContent() : initialContent;
+
+    if (!serviceContent.rootFolder || !serviceContent.propertyCollector) {
+      throw new Error('Service content missing rootFolder or propertyCollector');
+    }
+
+    logDebug('Service content', {
+      rootFolder: serviceContent.rootFolder,
+      propertyCollector: serviceContent.propertyCollector,
+    });
+
+    const datacenterDiscoveryXml = this.buildEnvelope(`    <RetrievePropertiesEx xmlns="urn:vim25">\n      <_this type="PropertyCollector">${serviceContent.propertyCollector}</_this>\n      <specSet>\n        <propSet>\n          <type>Folder</type>\n          <pathSet>childEntity</pathSet>\n        </propSet>\n        <objectSet>\n          <obj type="Folder">${serviceContent.rootFolder}</obj>\n        </objectSet>\n      </specSet>\n    </RetrievePropertiesEx>`);
+    const datacenterDiscoveryResponseXml = await this.sendSoapRequest(datacenterDiscoveryXml);
+    const datacenterDiscoveryParsed = await this.parseSoapBody(datacenterDiscoveryResponseXml);
+    if (!datacenterDiscoveryParsed?.RetrievePropertiesExResponse) {
+      throw new Error('Unexpected response when discovering datacenters');
+    }
+
+    const datacenterCandidates = this.extractValMoRefs(datacenterDiscoveryResponseXml);
+    const datacenterMoRefs = datacenterCandidates
+      .filter((entry) => entry.type === 'Datacenter' || entry.moRef.startsWith('datacenter-'))
+      .map((entry) => entry.moRef);
+
+    logDebug('Datacenters discovered', {
+      count: datacenterMoRefs.length,
+      samples: datacenterMoRefs.slice(0, 5),
+    });
+
+    const vmToDatacenter = new Map<string, { datacenterMoRef: string; datacenterName: string }>();
+    const discoveredVmList: string[] = [];
+    const visitedFolders = new Set<string>();
+    const visitedVMs = new Set<string>();
+
+    for (const datacenterMoRef of datacenterMoRefs) {
+      const dcDetailsXml = this.buildEnvelope(`    <RetrievePropertiesEx xmlns="urn:vim25">\n      <_this type="PropertyCollector">${serviceContent.propertyCollector}</_this>\n      <specSet>\n        <propSet>\n          <type>Datacenter</type>\n          <pathSet>name</pathSet>\n          <pathSet>vmFolder</pathSet>\n        </propSet>\n        <objectSet>\n          <obj type="Datacenter">${datacenterMoRef}</obj>\n        </objectSet>\n      </specSet>\n    </RetrievePropertiesEx>`);
+
+      const dcDetailsResponseXml = await this.sendSoapRequest(dcDetailsXml);
+      const dcDetailsParsed = await this.parseSoapBody(dcDetailsResponseXml);
+      const dcObjects =
+        dcDetailsParsed?.RetrievePropertiesExResponse?.returnval?.objects ??
+        dcDetailsParsed?.RetrievePropertiesExResponse?.returnval?.objects;
+
+      const normalizedDcObjects = Array.isArray(dcObjects) ? dcObjects : dcObjects ? [dcObjects] : [];
+      let datacenterName = datacenterMoRef;
+      let vmFolderMoRef: string | undefined;
+
+      for (const obj of normalizedDcObjects) {
+        const propSet = Array.isArray(obj.propSet) ? obj.propSet : obj.propSet ? [obj.propSet] : [];
+        for (const prop of propSet) {
+          const propName = prop.name;
+          const val: any = prop.val ?? prop._ ?? prop;
+          if (propName === 'name' && typeof val === 'string') {
+            datacenterName = val;
+          }
+          if (propName === 'vmFolder') {
+            vmFolderMoRef = val?._ ?? val;
+          }
+        }
+      }
+
+      if (!vmFolderMoRef) {
+        const vmFolderCandidates = this.extractValMoRefs(dcDetailsResponseXml);
+        vmFolderMoRef = vmFolderCandidates.find((entry) => entry.moRef.startsWith('group-v'))?.moRef;
+      }
+
+      if (!vmFolderMoRef) {
+        continue;
+      }
+
+      logDebug('Datacenter details', {
+        datacenterMoRef,
+        datacenterName,
+        vmFolderMoRef,
+      });
+
+      const folderQueue: string[] = [vmFolderMoRef];
+      let foldersVisitedForDc = 0;
+
+      while (folderQueue.length > 0) {
+        const folderMoRef = folderQueue.shift() as string;
+        if (visitedFolders.has(folderMoRef)) {
+          continue;
+        }
+
+        visitedFolders.add(folderMoRef);
+        foldersVisitedForDc += 1;
+
+        const folderChildrenXml = this.buildEnvelope(`    <RetrievePropertiesEx xmlns="urn:vim25">\n      <_this type="PropertyCollector">${serviceContent.propertyCollector}</_this>\n      <specSet>\n        <propSet>\n          <type>Folder</type>\n          <pathSet>childEntity</pathSet>\n        </propSet>\n        <objectSet>\n          <obj type="Folder">${folderMoRef}</obj>\n        </objectSet>\n      </specSet>\n    </RetrievePropertiesEx>`);
+
+        const folderChildrenResponseXml = await this.sendSoapRequest(folderChildrenXml);
+        await this.parseSoapBody(folderChildrenResponseXml);
+
+        const childEntries = this.extractValMoRefs(folderChildrenResponseXml);
+        for (const child of childEntries) {
+          const childMoRef = child.moRef;
+          const childType = child.type;
+
+          if (childType === 'Folder' || childMoRef.startsWith('group-v')) {
+            folderQueue.push(childMoRef);
+          } else if (childType === 'VirtualMachine' || childMoRef.startsWith('vm-')) {
+            if (!visitedVMs.has(childMoRef)) {
+              visitedVMs.add(childMoRef);
+              discoveredVmList.push(childMoRef);
+              vmToDatacenter.set(childMoRef, { datacenterMoRef, datacenterName });
+            }
+          }
+        }
+      }
+
+      logDebug('Folder traversal stats', {
+        datacenterMoRef,
+        foldersVisitedForDc,
+        totalFoldersVisited: visitedFolders.size,
+        vmsDiscovered: discoveredVmList.length,
+      });
+    }
+
+    logDebug('VM discovery complete', {
+      totalVMs: discoveredVmList.length,
+      samples: discoveredVmList.slice(0, 5),
+    });
+
+    const matchedVMs: string[] = [];
+    const nameMatches = new Map<string, string>();
+
+    const vmChunks = this.chunkArray(discoveredVmList, 100);
+    for (const vmChunk of vmChunks) {
+      if (matchedVMs.length >= params.maxResults) {
+        break;
+      }
+
+      const specSet = [
+        '      <specSet>',
+        '        <propSet>',
+        '          <type>VirtualMachine</type>',
+        '          <pathSet>name</pathSet>',
+        '        </propSet>',
+        '        <objectSet>',
+        vmChunk.map((vmRef) => `          <obj type="VirtualMachine">${vmRef}</obj>`).join('\n'),
+        '        </objectSet>',
+        '      </specSet>',
+      ].join('\n');
+
+      const vmNamesXml = this.buildEnvelope(`    <RetrievePropertiesEx xmlns="urn:vim25">\n      <_this type="PropertyCollector">${serviceContent.propertyCollector}</_this>\n${specSet}\n    </RetrievePropertiesEx>`);
+
+      const vmNamesResponseXml = await this.sendSoapRequest(vmNamesXml);
+      const vmNamesParsed = await this.parseSoapBody(vmNamesResponseXml);
+      const vmObjects = vmNamesParsed?.RetrievePropertiesExResponse?.returnval?.objects;
+      const normalizedVmObjects = Array.isArray(vmObjects) ? vmObjects : vmObjects ? [vmObjects] : [];
+
+      for (const obj of normalizedVmObjects) {
+        const objRef = obj.obj?._ ?? obj.obj;
+        const propSet = Array.isArray(obj.propSet) ? obj.propSet : obj.propSet ? [obj.propSet] : [];
+        const nameProp = propSet.find((prop: any) => prop.name === 'name');
+        const vmName = nameProp?.val ?? nameProp?._ ?? nameProp;
+        if (typeof objRef === 'string' && typeof vmName === 'string') {
+          const matches =
+            params.matchMode === 'exact'
+              ? vmName === params.nameQuery
+              : vmName.includes(params.nameQuery);
+          if (matches) {
+            matchedVMs.push(objRef);
+            nameMatches.set(objRef, vmName);
+            if (matchedVMs.length >= params.maxResults) {
+              break;
+            }
+          }
+        }
+      }
+
+      if (matchedVMs.length >= params.maxResults) {
+        break;
+      }
+    }
+
+    logDebug('Matched VMs', {
+      matchedCount: matchedVMs.length,
+      samples: matchedVMs.slice(0, 5).map((ref) => nameMatches.get(ref)),
+    });
+
+    if (matchedVMs.length === 0) {
+      return [];
+    }
+
+    const pathSets = ['name'];
+    if (params.includePowerState) {
+      pathSets.push('runtime.powerState');
+    }
+    if (params.includeUuidAndPath) {
+      pathSets.push('summary.config.uuid', 'summary.config.vmPathName');
+    }
+
+    const results: Array<Record<string, unknown>> = [];
+    const matchedChunks = this.chunkArray(matchedVMs, 100);
+
+    for (const matchChunk of matchedChunks) {
+      const propSetXml = [
+        '        <propSet>',
+        '          <type>VirtualMachine</type>',
+        ...pathSets.map((path) => `          <pathSet>${path}</pathSet>`),
+        '        </propSet>',
+      ].join('\n');
+
+      const objectSetXml = matchChunk
+        .map((vmRef) => `          <objectSet>\n            <obj type="VirtualMachine">${vmRef}</obj>\n          </objectSet>`) // keep structure per object
+        .join('\n');
+
+      const vmDetailsXml = this.buildEnvelope(
+        [
+          '    <RetrievePropertiesEx xmlns="urn:vim25">',
+          `      <_this type="PropertyCollector">${serviceContent.propertyCollector}</_this>`,
+          '      <specSet>',
+          propSetXml,
+          objectSetXml,
+          '      </specSet>',
+          '    </RetrievePropertiesEx>',
+        ].join('\n'),
+      );
+
+      const vmDetailsResponseXml = await this.sendSoapRequest(vmDetailsXml);
+      const vmDetailsParsed = await this.parseSoapBody(vmDetailsResponseXml);
+      const vmObjects = vmDetailsParsed?.RetrievePropertiesExResponse?.returnval?.objects;
+      const normalizedVmObjects = Array.isArray(vmObjects) ? vmObjects : vmObjects ? [vmObjects] : [];
+
+      for (const obj of normalizedVmObjects) {
+        const vmRef = obj.obj?._ ?? obj.obj;
+        if (typeof vmRef !== 'string') {
+          continue;
+        }
+
+        const propSet = Array.isArray(obj.propSet) ? obj.propSet : obj.propSet ? [obj.propSet] : [];
+        const entry: Record<string, unknown> = {
+          moRef: vmRef,
+        };
+
+        const datacenterInfo = vmToDatacenter.get(vmRef);
+        if (datacenterInfo) {
+          entry.datacenterMoRef = datacenterInfo.datacenterMoRef;
+          entry.datacenterName = datacenterInfo.datacenterName;
+        }
+
+        for (const prop of propSet) {
+          const propName = prop.name;
+          const val: any = prop.val ?? prop._ ?? prop;
+          if (propName === 'name' && typeof val === 'string') {
+            entry.name = val;
+          }
+          if (propName === 'runtime.powerState' && typeof val === 'string') {
+            entry.powerState = val;
+          }
+          if (propName === 'summary.config.uuid' && typeof val === 'string') {
+            entry.uuid = val;
+          }
+          if (propName === 'summary.config.vmPathName' && typeof val === 'string') {
+            entry.vmPathName = val;
+          }
+        }
+
+        if (!entry.name && nameMatches.has(vmRef)) {
+          entry.name = nameMatches.get(vmRef);
+        }
+
+        results.push(entry);
+      }
+    }
+
+    return results.slice(0, params.maxResults);
   }
 }
 
