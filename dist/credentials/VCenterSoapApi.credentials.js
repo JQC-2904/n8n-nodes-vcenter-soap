@@ -34,8 +34,8 @@ class VCenterSoapApi {
                 displayName: 'Allow Insecure TLS',
                 name: 'allowInsecure',
                 type: 'boolean',
-                default: false,
-                description: 'Whether to skip TLS certificate verification for lab environments',
+                default: true,
+                description: 'Skip TLS certificate verification (useful for self-signed or lab environments)',
             },
             {
                 displayName: 'Custom CA Certificate',
@@ -57,6 +57,7 @@ class VCenterSoapApi {
                 baseURL: '={{$credentials.baseUrl}}',
                 url: '/sdk',
                 method: 'POST',
+                skipSslCertificateValidation: true,
                 headers: {
                     'Content-Type': 'text/xml; charset=utf-8',
                 },

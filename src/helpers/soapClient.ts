@@ -48,7 +48,7 @@ export class VCenterSoapClient {
   private readonly builder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '', suppressBooleanAttributes: false });
 
   constructor(options: SoapClientOptions) {
-    this.options = options;
+    this.options = { allowInsecure: true, ...options };
 
     this.endpoint = this.normalizeEndpoint(options.baseUrl);
 
