@@ -16,7 +16,10 @@ interface RetrieveServiceContentResult {
         build?: string;
     };
     sessionManager: string;
+    rootFolder?: string;
+    propertyCollector?: string;
 }
+type MatchMode = 'exact' | 'contains';
 export declare class VCenterSoapClient {
     private readonly endpoint;
     private readonly config;
@@ -32,5 +35,15 @@ export declare class VCenterSoapClient {
     private sendSoapRequest;
     private extractSessionCookie;
     private parseSoapBody;
+    private extractValMoRefs;
+    private chunkArray;
+    searchVMByName(params: {
+        nameQuery: string;
+        matchMode: MatchMode;
+        maxResults: number;
+        includePowerState: boolean;
+        includeUuidAndPath: boolean;
+        debug?: boolean;
+    }): Promise<Array<Record<string, unknown>>>;
 }
 export {};
