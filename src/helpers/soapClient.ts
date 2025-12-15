@@ -72,13 +72,16 @@ export class VCenterSoapClient {
 
   private normalizeEndpoint(baseUrl: string): string {
     const trimmed = baseUrl.replace(/\/+$/, '').replace(/\/sdk\/vimService\.wsdl$/i, '/sdk');
+    if (!/^https:\/\//i.test(trimmed)) {
+      throw new Error('Only HTTPS endpoints are supported for SOAP transport.');
+    }
     if (trimmed.endsWith('/sdk')) return trimmed;
     return `${trimmed}/sdk`;
   }
 
   private createHttpsAgent(): https.Agent {
     return new https.Agent({
-      keepAlive: true,
+      keepAlive: false,
       rejectUnauthorized: !this.options.allowInsecure,
       ca: this.options.caCertificate,
     });
@@ -92,6 +95,16 @@ export class VCenterSoapClient {
         'soapenv:Body': body,
       },
     });
+  }
+
+  private normalizeSoapBody(body: any): string {
+    const envelope = typeof body === 'string' ? body : this.buildEnvelope(body);
+    const soapBody = (envelope instanceof Buffer ? envelope.toString('utf8') : String(envelope)).replace(/^\uFEFF/, '');
+    const normalized = soapBody.replace(/^\s+/, '');
+    if (!normalized.startsWith('<')) {
+      throw new Error('SOAP body must start with "<" after normalization.');
+    }
+    return normalized;
   }
 
   private parseResponse(xml: string): ParsedSoapResponse {
@@ -112,12 +125,9 @@ export class VCenterSoapClient {
     return match?.[1]?.trim();
   }
 
-  private async send(body: any, soapAction?: string): Promise<any> {
-    const envelope = typeof body === 'string' ? body : this.buildEnvelope(body);
-    const soapBody = (envelope instanceof Buffer ? envelope.toString('utf8') : String(envelope))
-      .replace(/^\uFEFF/, '')
-      .trim();
-    const soapActionHeader = soapAction ?? 'urn:vim25/7.0';
+  private async send(body: any, _soapAction?: string): Promise<any> {
+    const soapActionHeader = 'urn:vim25/7.0';
+    const soapBody = this.normalizeSoapBody(body);
     const headers: Record<string, string> = {
       'Content-Type': 'text/xml; charset=utf-8',
       Accept: 'text/xml',
@@ -129,7 +139,10 @@ export class VCenterSoapClient {
       headers.Cookie = `vmware_soap_session=${this.sessionCookie}`;
     }
 
-    const response = await this.http.post('', soapBody, { headers });
+    const response = await this.http.post('', soapBody, {
+      headers,
+      maxRedirects: 0,
+    });
 
     const setCookie = response.headers['set-cookie'];
     if (setCookie) {
