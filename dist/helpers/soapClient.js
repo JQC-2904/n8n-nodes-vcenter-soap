@@ -99,14 +99,30 @@ class VCenterSoapClient {
         }
     }
     buildEnvelope(innerXml) {
+        const normalizedInnerXml = this.ensureRetrievePropertiesExOptions(innerXml);
         return [
             '<?xml version="1.0" encoding="UTF-8"?>',
             '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:vim25">',
             '  <soapenv:Body>',
-            innerXml,
+            normalizedInnerXml,
             '  </soapenv:Body>',
             '</soapenv:Envelope>',
         ].join('\n');
+    }
+    ensureRetrievePropertiesExOptions(innerXml) {
+        const retrieveRegex = /<RetrievePropertiesEx\b[^>]*>[\s\S]*?<\/RetrievePropertiesEx>/m;
+        const match = innerXml.match(retrieveRegex);
+        if (!match) {
+            return innerXml;
+        }
+        const retrieveBlock = match[0];
+        const hasOptions = /<\/?(?:urn:)?options\b/i.test(retrieveBlock);
+        if (hasOptions) {
+            return innerXml;
+        }
+        const optionsElement = '      <options/>';
+        const retrieveWithOptions = retrieveBlock.replace('</RetrievePropertiesEx>', `${optionsElement}\n    </RetrievePropertiesEx>`);
+        return innerXml.replace(retrieveBlock, retrieveWithOptions);
     }
     escapeXml(value) {
         return value
