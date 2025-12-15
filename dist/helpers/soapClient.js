@@ -47,7 +47,7 @@ class VCenterSoapClient {
         this.sessionCookie = null;
         this.parser = new fast_xml_parser_1.XMLParser({ ignoreAttributes: false, attributeNamePrefix: '', removeNSPrefix: true });
         this.builder = new fast_xml_parser_1.XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '', suppressBooleanAttributes: false });
-        this.options = options;
+        this.options = { allowInsecure: true, ...options };
         this.endpoint = this.normalizeEndpoint(options.baseUrl);
         // TLS handling is explicit and scoped: use a custom https.Agent for SOAP requests only.
         // - If allowInsecure is true, certificate verification is skipped for lab environments.
