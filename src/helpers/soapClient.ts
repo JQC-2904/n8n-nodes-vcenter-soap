@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
-import https from 'https';
+import * as https from 'https';
 import { XMLBuilder, XMLParser } from 'fast-xml-parser';
 
 export interface SoapClientOptions {
@@ -64,7 +64,7 @@ export class VCenterSoapClient {
       httpsAgent,
       validateStatus: () => true,
       responseType: 'text',
-      transformResponse: [(response) => response],
+      transformResponse: [(response: string) => response],
     });
   }
 
@@ -127,7 +127,7 @@ export class VCenterSoapClient {
 
     const setCookie = response.headers['set-cookie'];
     if (setCookie) {
-      const session = setCookie.find((cookie) => cookie.startsWith('vmware_soap_session'));
+      const session = setCookie.find((cookie: string) => cookie.startsWith('vmware_soap_session'));
       if (session) {
         const match = session.match(/vmware_soap_session=([^;]+)/);
         if (match?.[1]) {
